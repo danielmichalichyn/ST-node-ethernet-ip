@@ -14,6 +14,7 @@ const services = {
     FIND_NEXT: 0x11,
     READ_TAG: 0x4c,
     WRITE_TAG: 0x4d,
+    START_UPLOAD: 0x4f,
     READ_TAG_FRAGMENTED: 0x52,
     WRITE_TAG_FRAGMENTED: 0x53,
     READ_MODIFY_WRITE_TAG: 0x4e,

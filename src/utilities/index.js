@@ -54,4 +54,15 @@ const stringToObj = str => {
     };
 };
 
-module.exports = { promiseTimeout, delay, stringToBuffer, bufferToString, objToString, stringToObj };
+const stringToBufferLE = (str,size) => {
+    str = str.toString(16);
+    // Adding padding to the hex string and converting from BE to LE.
+    while (str.length < size) {
+        str = '0' + str;
+    };
+    str = str.match(/.{1,2}/g);
+    // Reverse the string from Big Endian to Little Endian.
+    return Buffer.from(str.reverse().join("").toString(16),'hex');
+};
+
+module.exports = { promiseTimeout, delay, stringToBuffer, bufferToString, objToString, stringToObj, stringToBufferLE };

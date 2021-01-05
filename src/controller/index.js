@@ -3,6 +3,7 @@ const dateFormat = require("dateformat");
 const TagGroup = require("../tag-group");
 const { delay, promiseTimeout } = require("../utilities");
 const Queue = require("task-easy");
+const { Readable } = require('stream');
 
 const compare = (obj1, obj2) => {
     if (obj1.priority > obj2.priority) return true;
@@ -998,6 +999,178 @@ class Controller extends ENIP {
             }
         }
     }
+
+    /**
+     * Returns the ACD project file from the controller. It is required to make a stream subscription.
+     * Have the same function as file upload from Rockwell Logix 5000.
+     * @param {number} dwordSize Defines the size of bytes retrieved by each request. Leave empty for the default of 492 Bytes.
+     * @param {number} pointerSize Defines the initial size that we will retrieve of the file. Leave empty for the of 0 (Start of the file).
+     * @returns {Stream} Readable Stream
+     */
+    async _fileUpload(dwordSize,pointerSize) {
+
+        //We use READ_TAG here, but the 0x4c function is used to retrieve file upload parts aswell.
+        const { START_UPLOAD,READ_TAG } = CIP.MessageRouter.services;
+        const { LOGICAL } = CIP.EPATH.segments;
+
+        // Build Identity Object Logical Path Buffer
+        const identityPath = Buffer.concat([
+            LOGICAL.build(LOGICAL.types.ClassID, 0x8e), // Identity Object (0x8e)
+            LOGICAL.build(LOGICAL.types.InstanceID, 0x01) // Instance ID (0x01)
+        ]);
+
+        const readPropsErr = new Error("TIMEOUT occurred while subscribing to File Upload");
+        const readTagErr = new Error(`TIMEOUT occurred while reading File Upload part`);
+        
+        /**
+         * This DWORD portion of the code needs some explanation, i hope it's clear for the people reading it.
+         * Rockwell does not provide much information about the File Upload request, but using Wireshark and some other methods i've figured out how this works.
+         * In each request for the file part, we send a 4bytes pointer to know which portion of the file we are retrieving. Always starting in zero (0x00000000);
+         * In each request we send a DWORD portion (0x0000), as we know a DWORD have 4bytes. This is used by the PLC to know the quantity of bytes we will retrieve per request.
+         * The max bytes that the PLC can send at a time is 492 bytes, so if we configure our DWORD for 0x7b00 (123bytes), every request will be a complete portion of the total file.
+         * Remember that we are dealing with DWORD, so is 123bytes*4 = 492. We always have to remember that this is 4xBytes because of the DWORD.
+         * If we set our DWORD with 0xe803 (1000bytes), the PLC will consume the DWORD size with 8 requests of 492bytes, each equivalent to 123bytes*8 = 984, the PLC will make a 9th request with 64bytes left or 16*4 bytes.
+         */
+        dwordSize 
+            ? dwordSize = Buffer.from(stringToBufferLE(dwordSize,4),'hex')
+            : dwordSize = Buffer.from('7b00','hex');
+        /**
+         * This is incremented at every sucessfull request.
+         * We add the content of the request of the pointer size until we reach the total size of the file.
+         */
+        pointerSize 
+            ? pointerSize = Buffer.from(stringToBufferLE(pointerSize,8),'hex')
+            : pointerSize = Buffer.alloc(4); // Always starts with 0
+        
+        let dwordSizeDefault = dwordSize;
+        let project_size = Buffer.alloc(4);
+        let request_qty = Buffer.alloc(4);
+        let partial = 0;
+        
+        // Message Router to Embed in UCMM
+        const MR_UploadRequest = CIP.MessageRouter.build(START_UPLOAD, identityPath, []);
+        this.write_cip(MR_UploadRequest);
+
+        /** 
+         * This is a subscription message that we sent to initiate the Upload file.
+         * @returns {Buffer} Project Size in buffer (hex)
+         */
+        const data = await promiseTimeout(
+            new Promise((resolve, reject) => {
+                this.once("Request File Upload", (err, data) => {
+                    if (err && (err.generalStatusCode !== 6 && err.generalStatusCode !== 3)){
+                        reject(err);
+                    }
+                    resolve(data);
+                });
+            }),
+            this.state.timeout_sp,
+            readPropsErr
+        );
+        
+        if(!data){
+            throw "Error when getting project size from File Upload";
+        }
+        
+        try{
+            //Calculate how many partials request we have to make in order to fill all the dwordSize requested.
+            //Because the body only handles a max of 123 bytes per request.
+            if(dwordSize.readIntLE(0,2) <= 123){
+                partial = 1;
+            } else {
+                partial = (dwordSize.readIntLE(0,2)*4)/492;
+                partial%2 !== 0 ? partial = ~~partial+1 : null;
+            }
+            // Handle the request quantity we have to make in order to retrieve all file size from the PLC via upload.
+            data.length > 0 ? project_size = data : null;
+            request_qty = project_size.readIntLE(0,4)/(dwordSize.readIntLE(0,2)*4);
+            request_qty%2 !== 0 ? request_qty = ~~request_qty+1 : null;
+
+        } catch (e){
+            throw `Error when accessing project size and calculating request quantity! ${e}`;
+        }
+
+        let _index = 0;
+        let partialP = 1;
+        const context = this;
+        const _source = async function(){
+            try{
+                const i = _index++;
+                //Check if we reach the final of the file and returns null to the readable streaming.
+                if(i > (request_qty*partial)){
+                    return null
+                }
+                // Message Router to Embed in UCMM
+                const MR = CIP.MessageRouter.build(READ_TAG, identityPath, Buffer.concat([pointerSize,dwordSize]));
+                context.write_cip(MR);
+
+                // Wait for Response
+                const data = await promiseTimeout(
+                    new Promise((resolve, reject) => {
+                        //We have to use Read Tag here because the service used is the same as the ReadTag one.
+                        context.once("Read Tag", (err, data) => {
+                            if (err && (err.generalStatusCode !== 6 && err.generalStatusCode !== 3)){
+                                reject(err);
+                            }
+                            resolve(data);
+                        });
+                    }),
+                    context.state.timeout_sp,
+                    readTagErr
+                );
+                
+                // Incrementing the size based on the last response size (Always 492bytes if we are not in the end of the data uploading or in the end of a partial request).
+                pointerSize = pointerSize.readIntLE(0,4) + data.length;
+                pointerSize = stringToBufferLE(pointerSize,8);
+                
+                //Every request we have to subtract 123 bytes from the message. This is the max length a request body can handle
+                dwordSize.readIntLE(0,2) > 123 
+                    ? dwordSize = stringToBufferLE((dwordSize.readIntLE(0,2)-123),4)
+                    : null
+                
+                //Means that we reached the last request possible. This request have to be in a different size to accomodate the last bytes.
+                if(i === request_qty*partial-1) {
+                    dwordSize = (project_size.readIntLE(0,4)-pointerSize.readIntLE(0,4))/4;
+                    dwordSize%2 !== 0 ? dwordSize = ~~dwordSize+1 : null;
+                    dwordSize = stringToBufferLE(dwordSize,4);
+                } else if(dwordSize.readIntLE(0,2) <= 123 && partialP === partial) {
+                    //Reset the partial request once we have reached the max partial calcuted above.
+                    partialP = 1;
+                    dwordSize = dwordSizeDefault;
+                } else {
+                    partialP++
+                }
+                
+                return data;
+                
+            } catch (error){
+                //Destroy the stream if any error occurs.
+                stream.destroy(`Destroying Stream. ${error}`);
+            }
+        }
+
+        let streamingState = false;
+        const startStreaming = async () => {
+
+            if (streamingState) return;
+            //This implementation is to push all the parts to the readable stream.
+            streamingState = true;
+            while(streamingState) {
+                streamingState = stream.push(await _source());
+            }
+        }
+
+        /** 
+         * Readable stream implementation
+         */
+        const stream = new Readable({
+            read() {
+               startStreaming();
+            }
+        });
+
+        return stream;
+    }
     // endregion
 
     // region Event Handlers
@@ -1180,7 +1353,8 @@ class Controller extends ENIP {
             READ_MODIFY_WRITE_TAG,
             MULTIPLE_SERVICE_PACKET,
             FORWARD_OPEN,
-            FORWARD_CLOSE
+            FORWARD_CLOSE,
+            START_UPLOAD
 
         } = CIP.MessageRouter.services;
 
@@ -1226,6 +1400,9 @@ class Controller extends ENIP {
             case READ_MODIFY_WRITE_TAG:
                 this.emit("Read Modify Write Tag", error, data);
                 this.emit("Forward Close", error, data);
+                break;
+            case START_UPLOAD:
+                this.emit("Request File Upload", error, data);
                 break;
             case MULTIPLE_SERVICE_PACKET: {
                 // If service errored then propogate error
