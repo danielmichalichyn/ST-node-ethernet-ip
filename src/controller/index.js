@@ -1,7 +1,7 @@
 const { ENIP, CIP } = require("../enip");
 const dateFormat = require("dateformat");
 const TagGroup = require("../tag-group");
-const { delay, promiseTimeout } = require("../utilities");
+const { delay, promiseTimeout, stringToBufferLE } = require("../utilities");
 const Queue = require("task-easy");
 const { Readable } = require('stream');
 
