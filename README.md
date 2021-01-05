@@ -366,6 +366,32 @@ browser.on("Device Disconnected", device => {
     // 'device' is the disconnected device
 })
 ```
+### File Upload
+
+#### Retrieves the ACD file stored in the PLC.
+
+```javascript
+const { Controller } = require("st-ethernet-ip");
+
+const PLC = new Controller();
+
+PLC.connect("192.168.15.169", 0).then(async () => {
+    console.log(PLC.properties);
+    let stream = await PLC._fileUpload(1000,0);
+    
+    stream.on('data',chunk =>{
+        //Buffer parts of the project file.
+        console.log(chunk);
+    });
+    stream.on('end',() =>{
+        console.log("Project Upload finished!")
+    });
+    stream.on('error',err =>{
+        console.log(`Error on stream! ${err}`)
+    });
+});
+
+```
 
 ### New I/O Scanner - ALPHA - NOT FOR PRODUCTION
 
